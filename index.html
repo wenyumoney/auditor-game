@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+<title>审核员</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    background: #07080C;
+    display: grid; place-items: center;
+    overflow: hidden;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #wrap {
+    position: relative;
+    width: min(100vw, 56.25vh);
+    height: min(177.7vw, 100vh);
+    box-shadow: 0 0 0 1px rgba(255,255,255,.06), 0 40px 120px rgba(0,0,0,.9);
+  }
+  canvas { width: 100%; height: 100%; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c" width="1080" height="1920"></canvas></div>
+<script src="data.js"></script>
+<script>
+(function () {
+  var RULES = AUDITOR_DATA.RULES, CARDS = AUDITOR_DATA.CARDS;
+  var W = 1080, H = 1920;
+  var cv = document.getElementById('c');
+  var X = cv.getContext('2d');
+
+  var C = {
+    bg: '#07080C', panel: '#12141C', ink: '#F2F4F8', dim: '#6E7686',
+    brand: '#FF6699', pass: '#2ED573', fail: '#FF4757', warn: '#FFA502'
+  };
+
+  var RULE_EVERY = 5;          // 每答对/答错 5 张换一次规则
+  var VERDICT_MS = 430;
+  var CHANGE_MS = 950;
+  var START_MS = 4200, MIN_MS = 2600, STEP_MS = 180;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = a + 0x6D2B79F5 | 0;
+      var t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+
+  var S = null;
+
+  function shuffled(n, rnd) {
+    var a = [], i;
+    for (i = 0; i < n; i++) a.push(i);
+    for (i = n - 1; i > 0; i--) { var j = Math.floor(rnd() * (i + 1)); var t = a[i]; a[i] = a[j]; a[j] = t; }
+    return a;
+  }
+
+  function reset(seed) {
+    var s = seed == null ? (Date.now() % 2147483647) : seed;
+    var rnd = mulberry32(s);
+    S = {
+      seed: s, rnd: rnd, clock: 0,
+      phase: 'play', i: 0, answered: 0,
+      score: 0, combo: 0, bestCombo: 0, right: 0, wrong: 0, lives: 3,
+      card: '', rule: null, prevRule: null, lastWant: null,
+      ruleDeck: [], cardDeck: [],
+      t: START_MS, limit: START_MS, spawnedAt: 0,
+      flash: null, lastVerdict: null, changeAt: 0,
+      cursor: { x: 968, y: 1808, visible: false, clickAt: 0, clickX: 0, clickY: 0 },
+      best: loadBest(), shots: 0
+    };
+    S.cardDeck = shuffled(CARDS.length, rnd);
+    S.ruleDeck = shuffled(RULES.length, rnd);
+    nextRule(true);
+    startCard();
+  }
+
+  function loadBest() {
+    try { return parseInt(localStorage.getItem('auditor.best.v1') || '0', 10) || 0; } catch (e) { return 0; }
+  }
+  function saveBest(v) {
+    try { localStorage.setItem('auditor.best.v1', String(v)); } catch (e) {}
+  }
+
+  function nextRule(first) {
+    if (!S.ruleDeck.length) S.ruleDeck = shuffled(RULES.length, S.rnd);
+    var idx = S.ruleDeck.pop();
+    if (!first && RULES[idx] === S.rule) {          // 不允许连着两次同一条规则
+      S.ruleDeck.unshift(idx);
+      if (!S.ruleDeck.length) S.ruleDeck = shuffled(RULES.length, S.rnd);
+      idx = S.ruleDeck.pop();
+    }
+    S.prevRule = S.rule;
+    S.rule = RULES[idx];
+    S.ruleNo = idx;
+    S.ruleSeq = (S.ruleSeq || 0) + 1;   // 第几条规则（按顺序，不暴露内部下标）
+    S.lastWant = null;          // 换规则后不限制下一张卡的答案
+  }
+
+  function wantOf(ci) { return S.rule.ok(CARDS[ci]) ? 'pass' : 'fail'; }
+
+  // 抽卡时尽量让答案翻面：否则同一条规则下可能连出七八张「通过」，玩家不用读卡也能蒙对
+  function drawCardIndex() {
+    if (!S.cardDeck.length) S.cardDeck = shuffled(CARDS.length, S.rnd);
+    var top = S.cardDeck.length - 1;
+    if (S.lastWant && wantOf(S.cardDeck[top]) === S.lastWant) {
+      for (var k = top; k >= 0; k--) {
+        if (wantOf(S.cardDeck[k]) !== S.lastWant) {
+          var t = S.cardDeck[k]; S.cardDeck[k] = S.cardDeck[top]; S.cardDeck[top] = t;
+          break;
+        }
+      }
+    }
+    return S.cardDeck.pop();
+  }
+
+  function startCard() {
+    var ci = drawCardIndex();
+    S.card = CARDS[ci];
+    S.cardNo = ci;
+    S.lastWant = wantOf(ci);
+    S.limit = Math.max(MIN_MS, START_MS - Math.floor(S.i / 6) * STEP_MS);
+    S.t = S.limit;
+    S.spawnedAt = S.clock;
+    S.lastVerdict = null;
+    S.phase = 'play';
+  }
+
+  function want() { return S.rule.ok(S.card) ? 'pass' : 'fail'; }
+
+  function press(choice) {
+    if (S.phase !== 'play') return;
+    var ok = choice === want();
+    S.answered++;
+    S.shots++;
+    S.lastVerdict = { choice: choice, want: want() };
+    if (ok) {
+      S.combo++;
+      if (S.combo > S.bestCombo) S.bestCombo = S.combo;
+      S.right++;
+      S.score += 10 + Math.min(S.combo - 1, 4) * 2;
+    } else {
+      S.combo = 0;
+      S.wrong++;
+      S.lives--;
+    }
+    S.phase = 'verdict';
+    S.flash = { ok: ok, at: S.clock };
+  }
+
+  function tick(dt) {
+    S.clock += dt;
+    if (S.phase === 'play') {
+      S.t -= dt;
+      if (S.t <= 0) { S.t = 0; press(want() === 'pass' ? 'fail' : 'pass'); }
+      return;
+    }
+    if (S.phase === 'verdict' && S.clock - S.flash.at > VERDICT_MS) {
+      if (S.lives <= 0) return gameOver();
+      if (S.answered % RULE_EVERY === 0) {
+        nextRule(false);
+        S.changeAt = S.clock;
+        S.phase = 'change';
+        return;
+      }
+      S.i++; startCard(); return;
+    }
+    if (S.phase === 'change' && S.clock - S.changeAt > CHANGE_MS) { S.i++; startCard(); return; }
+  }
+
+  function gameOver() {
+    S.phase = 'over';
+    if (S.score > S.best) { S.best = S.score; saveBest(S.score); S.newBest = true; }
+    else S.newBest = false;
+  }
+
+  /* ---------- 绘制 ---------- */
+  function rr(x, y, w, h, r) {
+    X.beginPath();
+    X.moveTo(x + r, y);
+    X.arcTo(x + w, y, x + w, y + h, r);
+    X.arcTo(x + w, y + h, x, y + h, r);
+    X.arcTo(x, y + h, x, y, r);
+    X.arcTo(x, y, x + w, y, r);
+    X.closePath();
+  }
+  function font(px, weight) {
+    X.font = (weight || 700) + ' ' + px + 'px "Microsoft YaHei","PingFang SC","Noto Sans SC",sans-serif';
+  }
+  function num(px, weight) {
+    // 数字也走同一套中文无衬线：Consolas 的斜杠零在这个字号下会被看成 Ø
+    X.font = (weight || 800) + ' ' + px + 'px "Microsoft YaHei","PingFang SC","Noto Sans SC",sans-serif';
+  }
+  function textC(t, x, y, col, px, weight) {
+    font(px, weight); X.fillStyle = col; X.textAlign = 'center'; X.textBaseline = 'middle';
+    X.fillText(t, x, y);
+  }
+  function roundRect(x, y, w, h, r, fill, stroke, lw) {
+    rr(x, y, w, h, r);
+    if (fill) { X.fillStyle = fill; X.fill(); }
+    if (stroke) { X.strokeStyle = stroke; X.lineWidth = lw || 3; X.stroke(); }
+  }
+
+  // 静态纹理：扫描线 + 噪点，只画一次
+  var grain = null;
+  function makeGrain() {
+    grain = document.createElement('canvas');
+    grain.width = W; grain.height = H;
+    var g = grain.getContext('2d');
+    for (var y = 0; y < H; y += 4) {
+      g.fillStyle = 'rgba(255,255,255,0.012)';
+      g.fillRect(0, y, W, 1);
+    }
+    var r = mulberry32(7);
+    for (var i = 0; i < 2600; i++) {
+      g.fillStyle = 'rgba(255,255,255,' + (0.01 + r() * 0.03).toFixed(3) + ')';
+      g.fillRect(Math.floor(r() * W), Math.floor(r() * H), 2, 2);
+    }
+  }
+
+  function draw() {
+    var now = S.clock;
+    X.fillStyle = C.bg; X.fillRect(0, 0, W, H);
+    X.drawImage(grain, 0, 0);
+
+    // 顶部品牌色带
+    X.fillStyle = C.brand; X.fillRect(0, 0, W, 6);
+
+    // 标题
+    font(34, 800); X.fillStyle = C.dim; X.textAlign = 'left'; X.textBaseline = 'middle';
+    X.fillText('审核员', 96, 96);
+
+    // 命
+    for (var li = 0; li < 3; li++) {
+      X.beginPath();
+      X.arc(W - 96 - li * 52, 96, 13, 0, Math.PI * 2);
+      X.fillStyle = li < S.lives ? C.fail : 'rgba(255,255,255,0.10)';
+      X.fill();
+    }
+
+    // 分数
+    num(96, 800);
+    var scoreStr = String(S.score), sw = X.measureText(scoreStr).width;
+    X.textAlign = 'right'; X.fillStyle = C.ink;
+    X.fillText(scoreStr, W - 96, 214);
+    num(30, 600); X.fillStyle = C.dim;
+    X.textAlign = 'right';
+    X.fillText('分', W - 96 - sw - 16, 214);
+
+    // 连对
+    if (S.combo >= 2) {
+      var cw = 132;
+      roundRect(W - 96 - cw, 254, cw, 52, 26, 'rgba(46,213,115,0.14)', 'rgba(46,213,115,0.5)', 2);
+      num(28, 800); X.textAlign = 'center'; X.fillStyle = C.pass;
+      X.fillText('×' + S.combo, W - 96 - cw / 2, 281);
+    }
+
+    // 规则条
+    var changePulse = S.phase === 'change' ? Math.min(1, (now - S.changeAt) / 200) : 0;
+    roundRect(68, 316, W - 136, 96, 20, 'rgba(255,255,255,0.04)',
+      changePulse > 0 ? C.warn : 'rgba(255,255,255,0.10)', changePulse > 0 ? 4 : 3);
+    font(28, 800); X.textAlign = 'left'; X.fillStyle = S.phase === 'change' ? C.warn : C.dim;
+    X.fillText('规则 ' + S.ruleSeq, 104, 364);
+    textC(S.rule.t, W / 2 + 40, 364, C.ink, 46, 800);
+
+    // 卡片
+    if (S.phase !== 'change') {
+      var enter = Math.min(1, (now - S.spawnedAt) / 220);
+      var ease = 1 - Math.pow(1 - enter, 3);
+      var cy = 640 + (1 - ease) * 56;
+      X.save();
+      X.globalAlpha = 0.55 + 0.45 * ease;
+      roundRect(96, cy, W - 192, 600, 34, 'rgba(255,255,255,0.045)', 'rgba(255,255,255,0.10)', 3);
+
+      if (S.phase !== 'verdict') {
+        font(82, 900);
+        var maxW = W - 250, lines = [], cur = '';
+        for (var ci = 0; ci < S.card.length; ci++) {
+          var t2 = cur + S.card[ci];
+          if (X.measureText(t2).width > maxW && cur) { lines.push(cur); cur = S.card[ci]; }
+          else cur = t2;
+        }
+        if (cur) lines.push(cur);
+        var lh = 108, startY = cy + 300 - (lines.length - 1) * lh / 2;
+        font(82, 900); X.textAlign = 'center'; X.textBaseline = 'middle'; X.fillStyle = C.ink;
+        for (var k = 0; k < lines.length; k++) X.fillText(lines[k], W / 2, startY + k * lh);
+      }
+      X.restore();
+    }
+
+    // 倒计时
+    if (S.phase === 'play') {
+      var p = Math.max(0, S.t / S.limit);
+      roundRect(96, 1276, W - 192, 12, 6, 'rgba(255,255,255,0.08)');
+      if (p > 0) roundRect(96, 1276, (W - 192) * p, 12, 6, p > 0.3 ? C.brand : C.fail);
+    }
+
+    // 按钮
+    var dimAll = S.phase !== 'play';
+    btn(64, 1460, W / 2 - 96, 236, '驳回', C.fail, dimAll, S.lastVerdict && S.lastVerdict.choice === 'fail');
+    btn(W / 2 + 32, 1460, W / 2 - 96, 236, '通过', C.pass, dimAll, S.lastVerdict && S.lastVerdict.choice === 'pass');
+
+    // 判定闪现
+    if (S.phase === 'verdict' && S.flash) {
+      var a = Math.min(1, (now - S.flash.at) / 80) * Math.max(0, 1 - (now - S.flash.at - 240) / 190);
+      if (a > 0) {
+        X.save(); X.globalAlpha = a;
+        X.fillStyle = S.flash.ok ? 'rgba(46,213,115,0.20)' : 'rgba(255,71,87,0.24)';
+        X.fillRect(0, 0, W, H);
+        textC(S.flash.ok ? '✓ 判对了' : '× 判错了', W / 2, 900, S.flash.ok ? C.pass : C.fail, 122, 900);
+        if (!S.flash.ok) textC('正确答案：' + (S.flash.want === 'pass' ? '通过' : '驳回'), W / 2, 1030, C.ink, 52, 700);
+        X.restore();
+      }
+    }
+
+    // 规则变更
+    if (S.phase === 'change') {
+      var cp = Math.min(1, (now - S.changeAt) / 220);
+      X.save();
+      X.globalAlpha = cp;
+      X.fillStyle = 'rgba(7,8,12,0.90)'; X.fillRect(0, 0, W, H);
+      var dy = 900 - (1 - cp) * 30;
+      textC('规则已更新', W / 2, dy - 130, C.warn, 44, 800);
+      roundRect(120, dy - 40, W - 240, 150, 26, 'rgba(255,165,2,0.10)', C.warn, 3);
+      textC(S.rule.t, W / 2, dy + 35, C.ink, 58, 800);
+      textC('旧规则作废', W / 2, dy + 170, C.dim, 36, 600);
+      X.restore();
+    }
+
+    // 结束
+    if (S.phase === 'over') {
+      X.fillStyle = C.bg; X.fillRect(0, 0, W, H);
+      X.drawImage(grain, 0, 0);
+      var rank = S.score >= 260 ? '审核之神' : S.score >= 180 ? '审核主管' : S.score >= 100 ? '老审核员' : S.score >= 40 ? '试用期' : '刚入职';
+      textC('你被开除了', W / 2, 590, C.fail, 116, 900);
+      textC(rank, W / 2, 720, C.brand, 56, 800);
+      num(150, 900); X.fillStyle = C.ink; X.textAlign = 'center'; X.textBaseline = 'middle';
+      X.fillText(String(S.score), W / 2, 880);
+      textC('最终得分', W / 2, 990, C.dim, 34, 600);
+      textC('最长连对 ' + S.bestCombo + ' · 判对 ' + S.right + ' 次 · 误判 ' + S.wrong + ' 次', W / 2, 1100, C.ink, 42, 700);
+      textC((S.newBest ? '新纪录！' : '历史最高 ' + S.best), W / 2, 1180,
+        S.newBest ? C.pass : C.dim, 38, 700);
+      textC('按 R 或点击 重新应聘', W / 2, 1330, C.dim, 40, 600);
+    }
+
+    // 鼠标指针（录屏用；真人玩时由浏览器自己画，不显示这个）
+    if (S.cursor.visible) {
+      var cu = S.cursor;
+      if (cu.clickAt && now - cu.clickAt < 300) {
+        var kp = (now - cu.clickAt) / 300;
+        X.beginPath();
+        X.arc(cu.clickX, cu.clickY, 12 + kp * 38, 0, Math.PI * 2);
+        X.strokeStyle = 'rgba(255,255,255,' + (0.6 * (1 - kp)).toFixed(3) + ')';
+        X.lineWidth = 5; X.stroke();
+        X.beginPath();
+        X.arc(cu.clickX, cu.clickY, 5 + kp * 17, 0, Math.PI * 2);
+        X.strokeStyle = 'rgba(255,255,255,' + (0.35 * (1 - kp)).toFixed(3) + ')';
+        X.lineWidth = 3; X.stroke();
+      }
+      X.save();
+      X.translate(cu.x, cu.y);
+      X.scale(1.15, 1.15);
+      X.beginPath();
+      X.moveTo(0, 0);
+      X.lineTo(0, 44);
+      X.lineTo(11, 33);
+      X.lineTo(20, 52);
+      X.lineTo(30, 47);
+      X.lineTo(21, 29);
+      X.lineTo(36, 28);
+      X.closePath();
+      X.shadowColor = 'rgba(0,0,0,0.55)'; X.shadowBlur = 14; X.shadowOffsetY = 5;
+      X.fillStyle = '#FFFFFF'; X.fill();
+      X.shadowBlur = 0; X.shadowOffsetY = 0;
+      X.lineWidth = 2.6; X.strokeStyle = 'rgba(0,0,0,0.85)'; X.stroke();
+      X.restore();
+    }
+  }
+
+  function btn(x, y, w, h, label, col, dim, pressed) {
+    X.save();
+    X.globalAlpha = dim ? (pressed ? 1 : 0.40) : 1;
+    roundRect(x, y, w, h, 26,
+      pressed ? 'rgba(255,255,255,0.10)' : 'rgba(255,255,255,0.03)', col, 3);
+    var g = X.createLinearGradient(0, y, 0, y + h);
+    g.addColorStop(0, pressed ? 'rgba(255,255,255,0.14)' : 'rgba(255,255,255,0.05)');
+    g.addColorStop(1, 'rgba(255,255,255,0)');
+    roundRect(x, y, w, h, 26, g);
+    textC(label, x + w / 2, y + h / 2, col, 76, 900);
+    X.restore();
+  }
+
+  /* ---------- 输入 ---------- */
+  function handle(choice) {
+    if (S.phase === 'over') { reset(null); return; }
+    if (S.phase === 'play') press(choice);
+  }
+
+  cv.addEventListener('pointerdown', function (e) {
+    var r = cv.getBoundingClientRect();
+    var px = (e.clientX - r.left) / r.width * W;
+    var py = (e.clientY - r.top) / r.height * H;
+    if (S.phase === 'over') { handle(null); return; }
+    if (py < 1400) return;
+    handle(px < W / 2 ? 'fail' : 'pass');
+  });
+
+  window.addEventListener('keydown', function (e) {
+    var k = e.key.toLowerCase();
+    if (k === 'r') { reset(null); return; }
+    if (k === 'a' || k === 'arrowleft' || k === '1') handle('fail');
+    if (k === 'd' || k === 'arrowright' || k === '2') handle('pass');
+  });
+
+  /* ---------- 录屏/自动化钩子 ---------- */
+  window.__pause = function () { paused = true; };
+  window.__resume = function () { paused = false; };
+  window.__frame = function (dt) { tick(dt); draw(); };
+  window.__press = function (c) { handle(c); };
+  // 录屏用的鼠标：x/y 是画布坐标，click=true 时在该点打一圈涟漪
+  window.__cursor = function (x, y, click) {
+    S.cursor.visible = true;
+    S.cursor.x = x; S.cursor.y = y;
+    if (click) { S.cursor.clickAt = S.clock; S.cursor.clickX = x + 12; S.cursor.clickY = y + 10; }
+  };
+  window.__reset = function (seed) { reset(seed); draw(); };
+  window.__state = function () {
+    return {
+      phase: S.phase, i: S.i, card: S.card, cardNo: S.cardNo,
+      rule: S.rule.t, ruleId: S.rule.id, ruleNo: S.ruleNo,
+      want: S.phase === 'change' ? null : want(),
+      score: S.score, combo: S.combo, bestCombo: S.bestCombo,
+      lives: S.lives, answered: S.answered, right: S.right, wrong: S.wrong,
+      t: Math.round(S.t), limit: S.limit, seed: S.seed
+    };
+  };
+
+  /* ---------- 主循环 ---------- */
+  var paused = false, last = 0;
+  function loop(ts) {
+    if (!last) last = ts;
+    var dt = Math.min(64, ts - last);
+    last = ts;
+    if (!paused) { tick(dt); draw(); }
+    requestAnimationFrame(loop);
+  }
+
+  makeGrain();
+  reset(null);
+  draw();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
